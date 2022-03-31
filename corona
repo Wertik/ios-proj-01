@@ -1,0 +1,266 @@
+#!/bin/bash
+
+convert_date() {
+    date=$(echo "$1" | awk -F- '{ print $2"/"$3"/"$1 }')
+}
+
+verify_date() {
+    convert_date $1
+    date "+%d-%m-%Y" -d "$date" > /dev/null  2>&1
+    is_valid=$?
+
+    if [ $is_valid -ne 0 ]; then
+        echo "Invalid date $1 (Format: YYYY-DD-MM)" 1>&2
+        exit 2
+    fi
+}
+
+#TODO: Add switch & argument description
+USAGE="Usage: corona [-h] [FILTERS] [COMMAND] [LOG [LOG2 [...]]"
+VALID_COMMANDS=("infected" "merge" "gender" "age" "daily" "monthly" "yearly" "countries" "districts" "regions")
+
+
+is_valid_command() {
+    for c in "${VALID_COMMANDS[@]}"
+    do
+        if [ "$c" == "$1" ]; then
+            return 0
+        fi 
+    done
+    return 1
+}
+
+CONTENT=
+
+DATE_BEFORE=
+DATE_AFTER=
+GENDER=
+HISTOGRAM_WIDTH=
+while getopts g:b:a:sh name
+do
+    case $name in
+        a)
+            DATE_AFTER="$OPTARG"
+
+            verify_date $DATE_AFTER
+            DATE_AFTER="$date"
+            ;;
+        b)
+            DATE_BEFORE="$OPTARG"
+
+            verify_date $DATE_BEFORE
+            DATE_BEFORE="$date"
+            ;;
+        g)
+            GENDER="$OPTARG"
+
+            if [ "$GENDER" != "Z" -a "$GENDER" != "M" ]
+            then
+                echo "Invalid gender $GENDER" 1>&2
+                exit 2
+            fi
+            ;;
+        s)
+            eval next_arg=\${$OPTIND}
+
+            if [[ ! -z $next_arg && $next_arg != -* ]]; then
+                re='^[0-9]+$'
+                if ! [[ $next_arg =~ $re ]]; then    
+                    HISTOGRAM_WIDTH="?" # take default width
+                    break
+                fi
+
+                OPTIND=$(($OPTIND + 1))
+                HISTOGRAM_WIDTH=$next_arg
+            fi
+            ;;
+        h)
+            echo "$USAGE"
+            exit 0;;
+        ?)
+            exit 2;;
+    esac
+done
+
+shift $(($OPTIND - 1))
+
+for i in "$@"
+do
+    is_valid_command "$i"
+    if [[ "$?" == "0" ]]; then
+        continue
+    fi
+
+    # these should be the files to load
+    EXPANDED="$i"
+    for a in "$EXPANDED"; do
+        if [[ $a == *.gz ]]; then
+            CONTENT="$CONTENT"$(gzip -d -c "$a")
+        elif [[ $a == *.bz2 ]]; then
+            CONTENT="$CONTENT"$(bzip2 -d -c "$a")
+        else
+            CONTENT="$CONTENT"$(cat "$a")
+        fi
+    done
+done
+
+if [ "$CONTENT" == "" ]; then
+    CONTENT=$(cat)
+fi
+
+# Extract the header
+HEADER="id,datum,vek,pohlavi,kraj_nuts_kod,okres_lau_kod,nakaza_v_zahranici,nakaza_zeme_csu_kod,reportovano_khs"
+
+# Content with header removed
+CONTENT=$(echo "$CONTENT" | awk -F, '!/id,datum,vek/ { print $0 }')
+
+# Data validation
+# Amount of days in each month.
+MONTH_DAYS="31 28 31 30 31 30 31 31 30 31 30 31"
+
+# Date validation
+CONTENT=$(echo "$CONTENT" | awk -F, -vMONTH_DAYS="$MONTH_DAYS" '
+BEGIN { split(MONTH_DAYS, days, " ") }
+$0 == "" { next } 
+{ 
+    split($2, date, "-"); 
+    month = int(date[2])
+    if (month > 12 || month < 1 || days[month] < int(date[3])) {
+        print "Invalid date: " $0 | "cat 1>&2";
+        next;
+    }
+}
+{ print $0 }')
+
+# Age validation
+CONTENT=$(echo "$CONTENT" | awk -F, '$0 == "" { next } $3 < 0 && $3 != "" { print "Invalid age: " $0 | "cat 1>&2"; next; } { print $0 }')
+
+# Parse the command
+
+COMMAND="merge"
+
+if [ -z "$1" ]; then
+    if [ -z "$GENDER" -a -z "$DATE_BEFORE" -a -z "$DATE_AFTER" ]
+    then
+        echo "$HEADER"
+        if [ ! -z "$CONTENT" ]; then
+            echo "$CONTENT"
+        fi
+        exit 0 # no command & no filters
+    fi
+else
+    is_valid_command "$1"
+    if [[ "$?" == "0" ]]; then
+        COMMAND="$1"
+    fi
+fi
+
+# Filter after date
+if [ ! -z "$DATE_AFTER" ]; then
+    DATE_AFTER_FORMAT=$(date --date=$DATE_AFTER +"%Y %m %d")
+    CONTENT=$(echo "$CONTENT" | awk -v DATE_AFTER="$DATE_AFTER_FORMAT" -F, '{ v = $2; gsub("-", " ", v); if (mktime(v " 12 00 00") >= mktime(DATE_AFTER " 12 00 00")) { print $0 } }')
+fi
+
+# Filter before date
+if [ ! -z "$DATE_BEFORE" ]; then
+    DATE_BEFORE_FORMAT=$(date --date=$DATE_BEFORE +"%Y %m %d")
+    CONTENT=$(echo "$CONTENT" | awk -v DATE_BEFORE="$DATE_BEFORE_FORMAT" -F, '{ v = $2; gsub("-", " ", v); if (mktime(v " 12 00 00") <= mktime(DATE_BEFORE " 12 00 00")) { print $0 } }')
+fi
+
+# Gender filter
+if [ ! -z "$GENDER" ]; then
+    CONTENT=$(echo "$CONTENT" | awk -vGENDER="$GENDER" -F, '$4==GENDER' )
+fi
+
+# display_histogram CONTENT HISTOGRAM_WIDTH DEFAULT_WIDTH
+display_histogram() {
+    if [ -z "$2" ]; then
+        echo "$CONTENT"
+        return 0
+    fi
+
+    WIDTH=$2
+    if [[ "$WIDTH" == "?" ]]; then
+        WIDTH="$3" # use provided default
+    fi
+
+    echo "$1" | awk -F: -vWIDTH="$WIDTH" '{ hash_count = int($2) / WIDTH; format = "%0"hash_count"s"; res = sprintf(format, ""); gsub(" ", "#", res); print $1": " res; }'
+}
+
+# Commands
+case $COMMAND in
+    "infected")
+        echo "$CONTENT" | awk 'BEGIN { n=0 } $0 != "" { n++ } END { print n }'
+        exit 0;;
+    "merge")
+        echo "$HEADER"
+        if [ ! -z "$CONTENT" ]; then
+            echo "$CONTENT"
+        fi
+        exit 0;;
+    "gender")
+        CONTENT=$(echo "$CONTENT" | awk -F, '$0 == "" { next } BEGIN { m = 0; z = 0; n = 0 } $4=="M" { m++ } $4=="Z" { z++ } $4=="" { n++ } END { print "Z: " z; print "M: " m; print "None: " n }')
+        display_histogram "$CONTENT" "$HISTOGRAM_WIDTH" 100000
+        exit 0;;
+    "age")
+        AGE_GROUPS="0-5,6-15,16-25,26-35,36-45,46-55,56-65,66-75,86-95,96-105,>105,None"
+        CONTENT=$(echo "$CONTENT" | awk -F, -vAGE_GROUPS="$AGE_GROUPS" '
+        BEGIN {
+            split(AGE_GROUPS, age_groups, ",")
+            for (i = 1; i < 13; i++) {
+                groups[age_groups[i]] = 0;
+                order[i] = age_groups[i];
+            }
+        }
+        {
+            if ($3 > 105) {
+                groups[">105"]++;
+            } else if ($3 == "") {
+                groups["None"]++;
+            } else {
+                for (i = 1; i < 11; i++) {
+                    group = age_groups[i]
+
+                    split(group, age_limit, "-");
+                    if ($3 >= age_limit[1] && $3 <= age_limit[2]) {
+                        groups[group]++;
+                    }
+                }
+            }
+        }
+        END {
+            for (i = 1; i < 13; i++) {
+                group = order[i]
+                print sprintf("%-06s", group) ": " groups[group]
+            }
+        }')
+        display_histogram "$CONTENT" "$HISTOGRAM_WIDTH" 10000
+        exit 0;;
+    "daily")
+        CONTENT=$(echo "$CONTENT" | awk -F, '$0 == "" { next } { days[$2]++ } END { for (i in days) { print i ": " days[i] } }' | sort)
+        display_histogram "$CONTENT" "$HISTOGRAM_WIDTH" 500
+        exit 0;;
+    "monthly")
+        CONTENT=$(echo "$CONTENT" | awk -F, '$0 == "" { next } { split($2, date, "-"); months[date[1] "-" date[2]]++ } END { for (i in months) { print i ": " months[i] } }' | sort)
+        display_histogram "$CONTENT" "$HISTOGRAM_WIDTH" 10000
+        exit 0;;
+    "yearly")
+        CONTENT=$(echo "$CONTENT" | awk -F, '$0 == "" { next } { split($2, date, "-"); years[date[1]]++ } END { for (i in years) { print i ": " years[i] } }' | sort)
+        display_histogram "$CONTENT" "$HISTOGRAM_WIDTH" 100000
+        exit 0;;
+    "countries")
+        CONTENT=$(echo "$CONTENT" | awk -F, '$0 == "" { next } $8 != "CZ" && $8 != "" { arr[$8]++ } END { for (i in arr) { print i ": " arr[i] } }' | sort)
+        display_histogram "$CONTENT" "$HISTOGRAM_WIDTH" 100
+        exit 0;;
+    "districts")
+        CONTENT=$(echo "$CONTENT" | awk -F, '$0 == "" { next } $6 == "" { arr["None"]++; next; } { arr[$6]++ } END { for (i in arr) { print i ": " arr[i] } }' | sort)
+        display_histogram "$CONTENT" "$HISTOGRAM_WIDTH" 1000
+        exit 0;;
+    "regions")
+        CONTENT=$(echo "$CONTENT" | awk -F, '$0 == "" { next } $5 == "" { arr["None"]++; next; } { arr[$5]++ } END { for (i in arr) { print i ": " arr[i] } }' | sort)
+        display_histogram "$CONTENT" "$HISTOGRAM_WIDTH" 10000
+        exit 0;;
+    *)
+        printf "Invalid COMMAND %s.\n" "$1"
+        exit 2;;
+esac
