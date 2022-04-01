@@ -15,8 +15,42 @@ verify_date() {
     fi
 }
 
-#TODO: Add switch & argument description
-USAGE="Usage: corona [-h] [FILTERS] [COMMAND] [LOG [LOG2 [...]]"
+USAGE="Usage: corona [-h] [FILTERS] [COMMAND] [LOG [LOG2 [...]]
+Manage csv files containing information about COVID19 cases.
+
+When no COMMAND is provided, merge is executed.
+
+With no LOG files, read standard input.
+
+Commands
+    infected — print number of VALID entries
+    merge — merge input log files and print the result with single header on top
+    gender — print statistics of VALID entries based per gender (None for no gender provided)
+    age — print statistics of VALID entries based on age group
+    daily — print statistics of VALID entries for each day
+    monthly — print statistics of VALID entries for each month
+    yearly — print statistics of VALID entries for each year
+    countries — print statistics of VALID entries based on country (ignores CZ and emnpty values)
+    districts — print statistics of VALID entries based on district code
+    regions — print statistics of VALID entries based on region code
+
+Filters
+    -a DATETIME — filter entries after DATETIME
+        DATETIME format: YYYY-MM-DD
+    -b DATETIME — filter entries before DATETIME
+        DATETIME format: YYYY-MM-DD
+    -g GENDER — filter entries with GENDER
+        GENDER format: M (male) or Z (female)
+    -s [WIDTH] - set the width for histograms, WIDTH corresponds to how many # symbols the highest value of the statistic takes up
+                 when no WIDTH is provided, default (hardcoded) values are used
+
+-h — displays this
+
+Examples:
+    ./corona file
+    cat file | ./corona gender
+    ./corona -s 10 yearly file1 file2
+"
 VALID_COMMANDS=("infected" "merge" "gender" "age" "daily" "monthly" "yearly" "countries" "districts" "regions")
 
 
@@ -112,7 +146,7 @@ fi
 HEADER="id,datum,vek,pohlavi,kraj_nuts_kod,okres_lau_kod,nakaza_v_zahranici,nakaza_zeme_csu_kod,reportovano_khs"
 
 # Content with header removed
-CONTENT=$(echo "$CONTENT" | awk -F, '!/id,datum,vek/ { print $0 }')
+CONTENT=$(echo "$CONTENT" | awk -F, '!/id,datum,vek/ && !/^\s+$/ { print $0 }' | tr -d " \t")
 
 # Data validation
 # Amount of days in each month.
@@ -120,20 +154,33 @@ MONTH_DAYS="31 28 31 30 31 30 31 31 30 31 30 31"
 
 # Date validation
 CONTENT=$(echo "$CONTENT" | awk -F, -vMONTH_DAYS="$MONTH_DAYS" '
-BEGIN { split(MONTH_DAYS, days, " ") }
-$0 == "" { next } 
-{ 
-    split($2, date, "-"); 
-    month = int(date[2])
-    if (month > 12 || month < 1 || days[month] < int(date[3])) {
+    BEGIN { split(MONTH_DAYS, days, " ") }
+    $0 == "" { next }
+    $2 == "" { print $0; next; }
+    $2 !~ /[0-9]{4}-[0-9]{2}-[0-9]{2}/ { 
         print "Invalid date: " $0 | "cat 1>&2";
         next;
     }
-}
-{ print $0 }')
+    {
+        split($2, date, "-"); 
+        month = int(date[2])
+        if (month > 12 || month < 1 || days[month] < int(date[3])) {
+            print "Invalid date: " $0 | "cat 1>&2";
+            next;
+        }
+    }
+    { print $0 }
+')
 
 # Age validation
-CONTENT=$(echo "$CONTENT" | awk -F, '$0 == "" { next } $3 < 0 && $3 != "" { print "Invalid age: " $0 | "cat 1>&2"; next; } { print $0 }')
+CONTENT=$(echo "$CONTENT" | awk -F, '
+    $0 == "" { next }
+    ($3 < 0 && $3 != "") || ($3 != "" && $3 !~ /(^[0-9]+$)/) {
+        print "Invalid age: " $0 | "cat 1>&2";
+        next;
+    }
+    { print $0 }
+')
 
 # Parse the command
 
@@ -172,19 +219,39 @@ if [ ! -z "$GENDER" ]; then
     CONTENT=$(echo "$CONTENT" | awk -vGENDER="$GENDER" -F, '$4==GENDER' )
 fi
 
-# display_histogram CONTENT HISTOGRAM_WIDTH DEFAULT_WIDTH
-display_histogram() {
-    if [ -z "$2" ]; then
-        echo "$CONTENT"
+# display_result CONTENT HISTOGRAM_WIDTH DEFAULT_PER_UNIT
+# HISTOGRAM_WIDTH means "how many characters represent the highest value"
+display_result() {
+
+    # empty content, just return
+    if [ -z "$1" ]; then
         return 0
     fi
 
-    WIDTH=$2
-    if [[ "$WIDTH" == "?" ]]; then
-        WIDTH="$3" # use provided default
+    # no HISTOGRAM setting, just print the content
+    if [ -z "$2" ]; then
+        if [ ! -z "$1" ]; then
+            echo "$1"
+        fi
+        return 0
     fi
 
-    echo "$1" | awk -F: -vWIDTH="$WIDTH" '{ hash_count = int($2) / WIDTH; format = "%0"hash_count"s"; res = sprintf(format, ""); gsub(" ", "#", res); print $1": " res; }'
+    # Take the default width
+    if [[ "$2" == "?" ]]; then
+        PER_UNIT="$3" # use provided default
+    else
+        # Calculate value per hash from HISTOGRAM_WIDTH
+        # 20 =^ 1000
+
+        # find max value
+        MAX_VALUE=$(echo "$CONTENT" | awk -F: 'BEGIN { max = 0 } $2 > max { max = $2 } END { print max }')
+
+        # calc per unit
+        # max / width
+        let PER_UNIT=MAX_VALUE/HISTOGRAM_WIDTH
+    fi
+
+    echo "$1" | awk -F: -vWIDTH="$PER_UNIT" '{ hash_count = int($2) / WIDTH; format = "%0"hash_count"s"; res = sprintf(format, ""); gsub(" ", "#", res); print $1": " res; }'
 }
 
 # Commands
@@ -200,7 +267,7 @@ case $COMMAND in
         exit 0;;
     "gender")
         CONTENT=$(echo "$CONTENT" | awk -F, '$0 == "" { next } BEGIN { m = 0; z = 0; n = 0 } $4=="M" { m++ } $4=="Z" { z++ } $4=="" { n++ } END { print "Z: " z; print "M: " m; print "None: " n }')
-        display_histogram "$CONTENT" "$HISTOGRAM_WIDTH" 100000
+        display_result "$CONTENT" "$HISTOGRAM_WIDTH" 100000
         exit 0;;
     "age")
         AGE_GROUPS="0-5,6-15,16-25,26-35,36-45,46-55,56-65,66-75,86-95,96-105,>105,None"
@@ -212,7 +279,7 @@ case $COMMAND in
                 order[i] = age_groups[i];
             }
         }
-        {
+        $0 != "" {
             if ($3 > 105) {
                 groups[">105"]++;
             } else if ($3 == "") {
@@ -234,31 +301,31 @@ case $COMMAND in
                 print sprintf("%-06s", group) ": " groups[group]
             }
         }')
-        display_histogram "$CONTENT" "$HISTOGRAM_WIDTH" 10000
+        display_result "$CONTENT" "$HISTOGRAM_WIDTH" 10000
         exit 0;;
     "daily")
-        CONTENT=$(echo "$CONTENT" | awk -F, '$0 == "" { next } { days[$2]++ } END { for (i in days) { print i ": " days[i] } }' | sort)
-        display_histogram "$CONTENT" "$HISTOGRAM_WIDTH" 500
+        CONTENT=$(echo "$CONTENT" | awk -F, '$0 != "" { days[$2]++ } END { for (i in days) { print i ": " days[i] } }' | sort)
+        display_result "$CONTENT" "$HISTOGRAM_WIDTH" 500
         exit 0;;
     "monthly")
-        CONTENT=$(echo "$CONTENT" | awk -F, '$0 == "" { next } { split($2, date, "-"); months[date[1] "-" date[2]]++ } END { for (i in months) { print i ": " months[i] } }' | sort)
-        display_histogram "$CONTENT" "$HISTOGRAM_WIDTH" 10000
+        CONTENT=$(echo "$CONTENT" | awk -F, '$0 != "" { split($2, date, "-"); months[date[1] "-" date[2]]++ } END { for (i in months) { print i ": " months[i] } }' | sort)
+        display_result "$CONTENT" "$HISTOGRAM_WIDTH" 10000
         exit 0;;
     "yearly")
-        CONTENT=$(echo "$CONTENT" | awk -F, '$0 == "" { next } { split($2, date, "-"); years[date[1]]++ } END { for (i in years) { print i ": " years[i] } }' | sort)
-        display_histogram "$CONTENT" "$HISTOGRAM_WIDTH" 100000
+        CONTENT=$(echo "$CONTENT" | awk -F, '$0 != "" { split($2, date, "-"); years[date[1]]++ } END { for (i in years) { print i ": " years[i] } }' | sort)
+        display_result "$CONTENT" "$HISTOGRAM_WIDTH" 100000
         exit 0;;
     "countries")
         CONTENT=$(echo "$CONTENT" | awk -F, '$0 == "" { next } $8 != "CZ" && $8 != "" { arr[$8]++ } END { for (i in arr) { print i ": " arr[i] } }' | sort)
-        display_histogram "$CONTENT" "$HISTOGRAM_WIDTH" 100
+        display_result "$CONTENT" "$HISTOGRAM_WIDTH" 100
         exit 0;;
     "districts")
         CONTENT=$(echo "$CONTENT" | awk -F, '$0 == "" { next } $6 == "" { arr["None"]++; next; } { arr[$6]++ } END { for (i in arr) { print i ": " arr[i] } }' | sort)
-        display_histogram "$CONTENT" "$HISTOGRAM_WIDTH" 1000
+        display_result "$CONTENT" "$HISTOGRAM_WIDTH" 1000
         exit 0;;
     "regions")
         CONTENT=$(echo "$CONTENT" | awk -F, '$0 == "" { next } $5 == "" { arr["None"]++; next; } { arr[$5]++ } END { for (i in arr) { print i ": " arr[i] } }' | sort)
-        display_histogram "$CONTENT" "$HISTOGRAM_WIDTH" 10000
+        display_result "$CONTENT" "$HISTOGRAM_WIDTH" 10000
         exit 0;;
     *)
         printf "Invalid COMMAND %s.\n" "$1"
